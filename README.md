@@ -4,7 +4,9 @@ A real-time volumetric cloud generator built with Three.js and GLSL shaders. Thi
 
 **Live Demo:** [https://seu-nome-de-usuario.github.io/gerador-nuvens-volumetricas/](https://leoawen.github.io/volumetric-clouds/)
 
-![(https://github.com/leoawen/volumetric-clouds/blob/main/images/volumetric-clouds-screenshot.png](https://github.com/leoawen/volumetric-clouds/blob/main/images/volumetric-clouds-screenshot.png)
+![https://github.com/leoawen/volumetric-clouds/blob/main/images/volumetric-clouds-screenshoot-1.png](https://github.com/leoawen/volumetric-clouds/blob/main/images/volumetric-clouds-screenshoot-1.png)
+![https://github.com/leoawen/volumetric-clouds/blob/main/images/volumetric-clouds-screenshoot-2.png](https://github.com/leoawen/volumetric-clouds/blob/main/images/volumetric-clouds-screenshoot-2.png)
+![https://github.com/leoawen/volumetric-clouds/blob/main/images/volumetric-clouds-screenshoot-3.png](https://github.com/leoawen/volumetric-clouds/blob/main/images/volumetric-clouds-screenshoot-3.png)
 
 
 ## Features
