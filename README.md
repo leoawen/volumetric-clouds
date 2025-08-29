@@ -3,7 +3,6 @@
 A real-time volumetric cloud generator built with Three.js and GLSL shaders. This project allows for the creation of customizable, high-performance clouds with PBR lighting and post-processing effects like God Rays.
 
 **Live Demo:** [https://seu-nome-de-usuario.github.io/gerador-nuvens-volumetricas/](https://leoawen.github.io/volumetric-clouds/)
-*(Substitua pelo seu link real!)*
 
 ![(https://github.com/leoawen/volumetric-clouds/blob/main/images/volumetric-clouds-screenshot.png](https://github.com/leoawen/volumetric-clouds/blob/main/images/volumetric-clouds-screenshot.png)
 
