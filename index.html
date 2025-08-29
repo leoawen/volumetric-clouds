@@ -1,0 +1,1412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<title>Scalable Cloud Generator with Advanced Material</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+<style>
+body { margin: 0; background-color: #1a1a2a; color: #fff; font-family: Monospace; font-size: 13px; text-align: center; overflow: hidden; }
+#info { position: absolute; top: 10px; width: 100%; z-index: 100; text-shadow: 1px 1px 2px #000; }
+a { color: #87CEEB; }
+#progress-container { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 200; display: none; background: rgba(0,0,0,0.7); padding: 20px; border-radius: 10px;}
+#progress-bar { width: 300px; height: 20px; background-color: #444; border-radius: 5px; overflow: hidden; }
+#progress-fill { width: 0%; height: 100%; background-color: #87CEEB; transition: width 0.1s linear; }
+#progress-text { margin-top: 10px; }
+</style>
+</head>
+<body>
+<div id="info">
+Scalable Cloud Generator with Advanced Material<br/>
+Customizable cloud shape with PBR (Physically Based Rendering) lighting material.
+</div>
+
+<div id="progress-container">
+    <div id="progress-text">Generating 3D Texture...</div>
+    <div id="progress-bar">
+        <div id="progress-fill"></div>
+    </div>
+</div>
+
+<script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+            "three/addons/libs/stats.module.js": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/stats.module.js"
+        }
+    }
+</script>
+
+<script type="module">
+    // =============================================================================
+    //
+    //   Scalable Volumetric Cloud Generator V_0.2
+    //
+    //   MIT License
+    //   Copyright (c) 2024 Leonardo Soares Gonçalves
+    //
+    //   Developed with the assistance of AI vibecoding.
+    //
+    //   Permission is hereby granted, free of charge, to any person obtaining a copy
+    //   of this software and associated documentation files (the "Software"), to deal
+    //   in the Software without restriction, including without limitation the rights
+    //   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    //   copies of the Software, and to permit persons to whom the Software is
+    //   furnished to do so, subject to the following conditions:
+    //
+    //   The above copyright notice and this permission notice shall be included in all
+    //   copies or substantial portions of the Software.
+    //
+    //   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    //   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    //   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    //   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    //   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    //   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    //   SOFTWARE.
+    //
+    // =============================================================================
+
+
+    // =============================================================================
+    // ||                             IMPORTS & SETUP                             ||
+    // =============================================================================
+
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+    import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+    import WebGL from 'three/addons/capabilities/WebGL.js';
+    import Stats from 'three/addons/libs/stats.module.js';
+
+    // --- WebGL 2 Validation ---
+    // This effect requires WebGL 2 for 3D textures. This check ensures the browser supports it.
+    if ( ! WebGL.isWebGL2Available() ) {
+        document.body.appendChild( WebGL.getWebGL2ErrorMessage() );
+        throw new Error('WebGL 2 is not supported.');
+    }
+
+    // =============================================================================
+    // ||                          SHADER CODE (GLSL)                             ||
+    // =============================================================================
+    // This section contains the heart of the volumetric rendering: the GLSL shaders.
+    // The Vertex Shader is simple, preparing data for the Fragment Shader.
+    // The Fragment Shader performs the complex task of ray marching through the
+    // cloud volume to calculate the final color for each pixel.
+
+    const VERTEX_SHADER = /* glsl */`
+        // The camera position in world space.
+        uniform vec3 cameraPos;
+
+        // Data passed from the Vertex to the Fragment Shader.
+        out vec3 vOrigin;    // The ray's starting point (camera position in the object's local space).
+        out vec3 vDirection; // The direction of the ray from the camera to the current vertex.
+
+        void main() {
+            // Transform the vertex position to model-view space.
+            vec4 mvPosition = modelViewMatrix * vec4( position, 1.0 );
+
+            // Calculate the ray origin by transforming the world camera position into the local space of the cloud container.
+            vOrigin = vec3( inverse( modelMatrix ) * vec4( cameraPos, 1.0 ) ).xyz;
+
+            // The ray direction is simply the vector from the camera (vOrigin) to the vertex (position).
+            vDirection = position - vOrigin;
+
+            // Final vertex position in clip space.
+            gl_Position = projectionMatrix * mvPosition;
+        }
+    `;
+
+    const FRAGMENT_SHADER = /* glsl */`
+        // Set precision for floating point numbers and samplers for performance/accuracy.
+        precision highp float;
+        precision highp sampler3D;
+        
+        // Data received from the Vertex Shader.
+        in vec3 vOrigin;
+        in vec3 vDirection;
+
+        // The final output color of the pixel.
+        out vec4 color;
+
+        // --- UNIFORMS (Complete Set) ---
+        // These are variables passed from JavaScript to the shader, allowing for real-time control.
+        
+        // Textures
+        uniform highp sampler3D uVolumeTexture;     // The 3D noise texture defining the cloud's internal density.
+        uniform sampler2D uBlueNoise;               // A 2D texture used for high-quality random jittering to reduce banding.
+        uniform sampler2D uDepthTexture;            // The depth map of the solid scene objects, for occlusion.
+
+        // Scene & Camera Parameters
+        uniform vec2 uBlueNoiseSize;
+        uniform vec2 uResolution;
+        uniform vec3 uSunColor;
+        uniform float uSunIntensity;
+        uniform vec3 uLightDir;                     // Direction of the main light source (sun).
+        uniform vec3 uAmbientColor;
+        uniform float uAmbientIntensity;
+        uniform mat4 uProjectionMatrixInverse;
+        uniform mat4 uViewMatrixInverse;
+        uniform mat4 uModelMatrix;
+        uniform mat4 modelViewMatrix;
+        uniform float uCameraNear;
+        uniform float uCameraFar;
+
+        // Cloud Material & Rendering Parameters
+        uniform float uOpacity;
+        uniform int uMaxSteps;                      // Ray marching quality: how many steps to take through the volume.
+        uniform int uLightSteps;                    // Quality for calculating light absorption inside the cloud.
+        uniform float uDensityThreshold;
+        uniform float uDensityMultiplier;
+        uniform vec3 uTextureOffset;                // Used for animating the cloud texture.
+        uniform float uTextureTiling;               // Controls the repetition of the 3D texture.
+        uniform bool uOcclusionMode;                // A switch to render the cloud for the God Rays pass.
+
+        // --- Volumetric Mask Uniforms ---
+        // These control the overall shape of the cloud.
+        // NOTE: Names are in Portuguese to maintain 1:1 correspondence with the original JS code.
+        uniform float u_mask_raio;                  // (Radius) Base radius of the spherical mask.
+        uniform float u_mask_achatamentoCima;       // (Flatten Top) Y-axis flattening for the top half.
+        uniform float u_mask_achatamentoBaixo;      // (Flatten Bottom) Y-axis flattening for the bottom half.
+        uniform float u_mask_achatamentoXpos;       // (Flatten X positive)
+        uniform float u_mask_achatamentoXneg;       // (Flatten X negative)
+        uniform float u_mask_achatamentoZpos;       // (Flatten Z positive)
+        uniform float u_mask_achatamentoZneg;       // (Flatten Z negative)
+        uniform float u_mask_softness;              // Softness of the mask's edges.
+        uniform float u_mask_forcaRuido;            // (Noise Strength) Strength of the primary noise deformation.
+        uniform highp sampler3D u_mask_noiseMap;    // 3D texture for primary shape deformation.
+        uniform float u_mask_forcaRuidoDetalhe;     // (Detail Noise Strength) Strength of the detail noise.
+        uniform highp sampler3D u_mask_noiseDetailMap; // 3D texture for fine detail deformation.
+        uniform bool u_mask_visualize;              // Switch to visualize the mask shape itself.
+        
+        // --- SHADER FUNCTIONS & CONSTANTS ---
+        #define PI 3.14159265359
+        const vec3 EXTINCTION_MULT = vec3(0.6, 0.65, 0.7); // How much light is absorbed/scattered.
+        const float DUAL_LOBE_WEIGHT = 0.8; // Controls the mix between forward and backward scattering.
+
+        // --- START OF UPDATED VOLUMETRIC MASK CODE ---
+        // This section defines the overall shape of the cloud before applying the detailed 3D noise.
+        // It works by creating a base sphere and deforming it with two layers of 3D noise.
+        
+        // Signed Distance Function (SDF) for the mask. Returns distance to the surface (>0 is inside).
+        float getMaskSDF(vec3 p) {
+            if (u_mask_raio <= 0.0) return -1.0; // If radius is zero, we are always outside.
+
+            // 1. Flattening works by scaling the sample point 'p' based on its position.
+            vec3 p_distorted = p;
+            if (p.y > 0.0) p_distorted.y /= u_mask_achatamentoCima;  else p_distorted.y /= u_mask_achatamentoBaixo;
+            if (p.x > 0.0) p_distorted.x /= u_mask_achatamentoXpos;  else p_distorted.x /= u_mask_achatamentoXneg;
+            if (p.z > 0.0) p_distorted.z /= u_mask_achatamentoZpos;  else p_distorted.z /= u_mask_achatamentoZneg;
+            
+            float dist = length(p_distorted);
+            if (dist == 0.0) return u_mask_raio; // Avoid division by zero at the center.
+            vec3 dir = p_distorted / dist;
+            
+            // 2. The texture coordinate is the same for both noise layers.
+            vec3 tex_coord = (dir * u_mask_raio) * 0.5 + 0.5;
+            
+            // 3. We read the value from BOTH noise textures.
+            float noiseValuePrincipal = (texture(u_mask_noiseMap, tex_coord).r * 2.0 - 1.0);
+            float noiseValueDetalhe = (texture(u_mask_noiseDetailMap, tex_coord).r * 2.0 - 1.0);
+
+            // 4. Calculate the displacement for each noise layer separately.
+            float displacementPrincipal = noiseValuePrincipal * u_mask_forcaRuido;
+            float displacementDetalhe = noiseValueDetalhe * u_mask_forcaRuidoDetalhe;
+
+            // 5. Sum the two displacements to get the final result.
+            float totalDisplacement = displacementPrincipal + displacementDetalhe;
+            
+            // The function returns the distance from the surface. > 0 means "inside".
+            return (u_mask_raio + totalDisplacement) - dist;
+        }
+
+        // Converts the SDF value into a soft mask factor between 0.0 and 1.0.
+        float getMaskFactor(vec3 p) {
+            float sdf = getMaskSDF(p);
+            return smoothstep(0.0, u_mask_softness, sdf);
+        }
+        // --- END OF VOLUMETRIC MASK CODE ---
+        
+        // The Henyey-Greenstein phase function models how light scatters within a medium.
+        // It determines whether light is scattered forward, backward, or sideways.
+        float HenyeyGreenstein(float g, float mu) {
+            float gg = g * g;
+            return (1.0 / (4.0 * PI)) * ((1.0 - gg) / pow(1.0 + gg - 2.0 * g * mu, 1.5));
+        }
+            
+        // A dual-lobe phase function combines forward and backward scattering for a more realistic cloud appearance.
+        float PhaseFunction(float g, float costh) {
+            return mix(HenyeyGreenstein(-g, costh), HenyeyGreenstein(g, costh), DUAL_LOBE_WEIGHT);
+        }
+
+        // Calculates the intersection points of a ray with the bounding box of the cloud (a unit cube).
+        vec2 hitBox( vec3 orig, vec3 dir ) {
+            const vec3 box_min = vec3( -0.5 );
+            const vec3 box_max = vec3( 0.5 );
+            vec3 inv_dir = 1.0 / dir;
+            vec3 tmin_tmp = ( box_min - orig ) * inv_dir;
+            vec3 tmax_tmp = ( box_max - orig ) * inv_dir;
+            vec3 tmin = min( tmin_tmp, tmax_tmp );
+            vec3 tmax = max( tmin_tmp, tmax_tmp );
+            float t0 = max( tmin.x, max( tmin.y, tmin.z ) );
+            float t1 = min( tmax.x, min( tmax.y, tmax.z ) );
+            return vec2( t0, t1 );
+        }
+
+        // Reconstructs the world position of a point from the depth buffer.
+        vec3 getWorldPosFromDepth(float depth, vec2 screenUV) {
+            vec2 ndc = screenUV * 2.0 - 1.0;
+            float z = depth * 2.0 - 1.0;
+            vec4 clipPos = vec4(ndc, z, 1.0);
+            vec4 worldPos = uViewMatrixInverse * uProjectionMatrixInverse * clipPos;
+            return worldPos.xyz / worldPos.w;
+        }
+        
+        // Samples the density at a given point 'p' inside the cloud volume.
+        float getDensity(vec3 p) {
+            // First, get the shaping mask value. If we're outside the mask, density is zero.
+            float maskFactor = getMaskFactor(p);
+            if (maskFactor <= 0.0) {
+                return 0.0;
+            }
+
+            // UNIFIED LOGIC: Decide which density to use.
+            float finalDensity;
+            if (u_mask_visualize) {
+                // VISUALIZATION MODE: Return a constant (solid) density,
+                // but still with the soft edges from the mask.
+                finalDensity = 1.0;
+            } else {
+                // NORMAL MODE: Calculate density from the 3D noise texture.
+                vec3 texCoord = (p + 0.5) * uTextureTiling;
+                vec3 offsetTexCoord = texCoord + uTextureOffset;
+                float noiseDensity = texture(uVolumeTexture, offsetTexCoord).r;
+                if (noiseDensity < uDensityThreshold) return 0.0;
+                finalDensity = noiseDensity;
+            }
+            
+            // Apply the multiplier and mask factor in both cases.
+            return finalDensity * uDensityMultiplier * maskFactor;
+        }
+
+        // ======================= START OF CORRECTION =======================
+        // This function calculates how much sunlight reaches a point inside the cloud.
+        // It does this by marching another short ray from the sample point towards the sun
+        // and accumulating the density along the way.
+        float CalculateLightEnergy(vec3 samplePos, vec3 lightDir) {
+            float stepLength = 1.0 / float(uLightSteps);
+            float lightRayDensity = 0.0;
+            for(int i = 0; i < uLightSteps; i++) {
+                // We use the midpoint method (+ 0.5), which is more stable.
+                vec3 p = samplePos + lightDir * (float(i) + 0.5) * stepLength;
+                // Check if the light-ray sample is still inside the bounding box.
+                if (all(greaterThan(p, vec3(-0.5))) && all(lessThan(p, vec3(0.5)))) {
+                    lightRayDensity += getDensity(p) * stepLength;
+                }
+            }
+            // Beer's Law: The more density, the less light penetrates (exponential decay).
+            return exp(-lightRayDensity);
+        }
+        // ======================== END OF CORRECTION ========================
+
+        // Converts non-linear depth from the depth buffer to linear distance from the camera.
+        float linearize_depth(float d, float zNear, float zFar) {
+            if (d == 1.0) return zFar; 
+            return zNear * zFar / (zFar + d * (zNear - zFar));
+        }
+
+        // The main function executed for every pixel.
+        void main() {
+            // 1. SETUP THE RAY
+            vec3 rayDir = normalize(vDirection);
+            // Find where the ray enters and exits the cloud's bounding box.
+            vec2 bounds = hitBox(vOrigin, rayDir);
+            if (bounds.x >= bounds.y) discard; // If we don't hit the box, discard the pixel.
+            bounds.x = max(bounds.x, 0.0);
+
+            // 2. SETUP OCCLUSION
+            // Get the distance to the solid objects already rendered in the scene.
+            vec2 screenUV = gl_FragCoord.xy / uResolution;
+            float sceneDepthValue = texture(uDepthTexture, screenUV).r;
+            float sceneLinearDistance = linearize_depth(sceneDepthValue, uCameraNear, uCameraFar);
+            
+            // 3. RAY MARCHING LOOP
+            float rayLength = bounds.y - bounds.x;
+            if (rayLength < 0.001) discard;
+
+            float stepSize = rayLength / float(uMaxSteps);
+            // Jitter the starting position to reduce artifacts (banding).
+            float jitter = texture(uBlueNoise, mod(gl_FragCoord.xy, uBlueNoiseSize) / uBlueNoiseSize).r;
+            vec3 p = vOrigin + (bounds.x + jitter * stepSize) * rayDir;
+
+            // Initialize accumulators.
+            vec3 accumulatedColor = vec3(0.0);
+            vec3 transmittance = vec3(1.0); // How much light is left after passing through the volume.
+            float mu = dot(rayDir, uLightDir); // Angle between view ray and light direction.
+            float fade_zone = stepSize * 2.0; // For soft blending at the edges of the volume.
+            
+            for (int i = 0; i < uMaxSteps; i++) {
+                // Check for occlusion: if the current point on the ray is behind a solid object, stop.
+                vec4 viewSpacePos = modelViewMatrix * vec4(p, 1.0);
+                float rayPointDistance = abs(viewSpacePos.z / viewSpacePos.w);
+                if (rayPointDistance > sceneLinearDistance) break;
+                
+                // Safety break for rays near the exit point.
+                float dist_traveled = (float(i) * stepSize) + (jitter * stepSize);
+                float dist_remaining = rayLength - dist_traveled;
+                if (dist_remaining < 0.0) break;
+
+                // Sample the density at the current point.
+                float density = getDensity(p);
+
+                if (density > 0.01) {
+                    // If there's density, calculate lighting.
+                    float lightEnergy = CalculateLightEnergy(p, uLightDir);
+                    
+                    // Direct lighting (from the sun).
+                    vec3 sunLuminance = uSunColor * uSunIntensity * lightEnergy;
+                    float phase = PhaseFunction(0.3, mu);
+                    vec3 sunScattering = sunLuminance * phase;
+
+                    // Ambient lighting (approximates light from all other directions).
+                    vec3 ambientLuminance = uAmbientColor * uAmbientIntensity;
+                    vec3 ambientScattering = ambientLuminance;
+
+                    // Combine lighting and apply density.
+                    vec3 totalScattering = (sunScattering + ambientScattering) * density * stepSize;
+
+                    // Apply a soft fade near the exit point of the volume to prevent hard edges.
+                    float fade_alpha = smoothstep(0.0, fade_zone, dist_remaining);
+                    totalScattering *= fade_alpha;
+
+                    // Absorption: reduce the amount of light passing through this step.
+                    vec3 stepTransmittance = exp(-density * stepSize * EXTINCTION_MULT * uOpacity);
+                    
+                    // "Front-to-back" compositing: add the scattered light, attenuated by the transmittance from previous steps.
+                    accumulatedColor += transmittance * totalScattering;
+                    // Update the total transmittance for the next steps.
+                    transmittance *= stepTransmittance;
+                    
+                    // Early exit optimization: if the cloud has become almost fully opaque, stop.
+                    if (length(transmittance) < 0.01) break;
+                }
+                // Move to the next point along the ray.
+                p += rayDir * stepSize;
+            }
+
+            // 4. FINAL OUTPUT
+            // Special mode for rendering the God Rays occlusion mask.
+            if (uOcclusionMode) {
+                float alpha = 1.0 - transmittance.r;
+                color = vec4(0.0, 0.0, 0.0, alpha); // Render black with alpha based on cloud opacity.
+                return;
+            }
+            
+            // Normal mode: output the accumulated color and the final alpha.
+            color = vec4(accumulatedColor, 1.0 - transmittance.r);
+        }
+    `;
+
+    // =============================================================================
+    // ||                   GLOBAL VARIABLES & PARAMETERS                         ||
+    // =============================================================================
+
+    // --- Three.js Core Components ---
+    let renderer, scene, camera, controls, material, directionalLight, ambientLight, clock;
+    let mesh; // The main cloud volume mesh.
+    let depthTarget; // Render target for the scene's depth map.
+    let stats; // Performance monitor (FPS).
+    
+    // --- God Rays Effect Variables ---
+    let sun, sunMaterial;
+    let post_scene, post_camera, post_quad;
+    let occlusionRenderTarget, godraysRenderTarget, finalRenderTarget;
+    let godraysMaterial, finalCompositeMaterial, finalPassMaterial;
+    let occlusionMaterialBlack, occlusionMaterialWhite;
+    const occluderMeshes = []; // Array to hold meshes that block god rays.
+    const originalMaterials = new Map(); // Map to restore original materials after the occlusion pass.
+  
+
+    // --- Layer Constants ---
+    // Using layers allows us to render different parts of the scene in separate passes.
+    const SOLID_LAYER = 1;  // For solid objects like the ground and spheres.
+    const VOLUME_LAYER = 2; // For volumetric objects like the cloud and the sun billboard.
+
+    // --- Control Parameters (GUI and Logic) ---
+    // These parameters are exposed in the GUI for real-time tweaking.
+    const parameters = {
+        // Texture Generation
+        textureSize: 96,
+        cloudCoverage: 0.55,
+        cloudSoftness: 0.05,
+        noiseScale: 3.5,
+        octaves: 5,
+        persistence: 0.5,
+        lacunarity: 3.0,
+        noiseIntensity: 1.0,
+        seed: Math.random() * 1000.0,
+        regenerateTexture: function() { bake3DTexture(); },
+        
+        // Cloud Shape (Shader)
+        textureTiling: 2.0,
+        
+        // Material & Rendering (Shader)
+        densityThreshold: 0.0,
+        densityMultiplier: 80.0,
+        opacity: 6.0,
+        raymarchSteps: 44,
+        lightSteps: 1,
+
+        // Scale & Animation
+        containerScale: 120.0,
+        isAnimating: true,
+        animationSpeedX: 0.02,
+        animationSpeedY: 0.0,
+        animationSpeedZ: 0.01,
+
+        // Lighting
+        ambientLightIntensity: 1.85,
+        directionalLightIntensity: 4.0,
+    };
+    
+    // --- DOM Element References ---
+    const progressContainer = document.getElementById('progress-container');
+    const progressFill = document.getElementById('progress-fill');
+
+    // =============================================================================
+    // ||                 NOISE GENERATION UTILITIES                            ||
+    // =============================================================================
+    // This section contains helper classes and functions to generate Perlin noise,
+    // which is the foundation for the procedural 3D cloud texture.
+
+    function createSeededRandom(seed) {
+        return function() {
+            let t = seed += 0x6D2B79F5;
+            t = Math.imul(t ^ t >>> 15, t | 1);
+            t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+            return ((t ^ t >>> 14) >>> 0) / 4294967296;
+        }
+    }
+
+    class ImprovedNoise {
+        constructor(seededRandom = Math.random) {
+            const p = new Uint8Array(256);
+            for (let i = 0; i < 256; i++) { p[i] = i; }
+            for (let i = 255; i > 0; i--) {
+                const j = Math.floor(seededRandom() * (i + 1));
+                [p[i], p[j]] = [p[j], p[i]];
+            }
+            this.p = new Uint8Array(512);
+            for (let i = 0; i < 256; i++) { this.p[i] = this.p[i + 256] = p[i]; }
+        }
+        noise(x, y, z) {
+            const p = this.p;
+            const xi = Math.floor(x) & 255; const yi = Math.floor(y) & 255; const zi = Math.floor(z) & 255;
+            const xf = x - Math.floor(x); const yf = y - Math.floor(y); const zf = z - Math.floor(z);
+            const u = this.fade(xf); const v = this.fade(yf); const w = this.fade(zf);
+            const aaa = p[p[p[xi] + yi] + zi]; const aab = p[p[p[xi] + yi] + zi + 1];
+            const aba = p[p[p[xi] + yi + 1] + zi]; const abb = p[p[p[xi] + yi + 1] + zi + 1];
+            const baa = p[p[p[xi + 1] + yi] + zi]; const bab = p[p[p[xi + 1] + yi] + zi + 1];
+            const bba = p[p[p[xi + 1] + yi + 1] + zi]; const bbb = p[p[p[xi + 1] + yi + 1] + zi + 1];
+            return this.lerp(w, this.lerp(v, this.lerp(u, this.grad(p[aaa], xf, yf, zf), this.grad(p[baa], xf - 1, yf, zf)),
+                                            this.lerp(u, this.grad(p[aba], xf, yf - 1, zf), this.grad(p[bba], xf - 1, yf - 1, zf))),
+                            this.lerp(v, this.lerp(u, this.grad(p[aab], xf, yf, zf - 1), this.grad(p[bab], xf - 1, yf, zf - 1)),
+                                            this.lerp(u, this.grad(p[abb], xf, yf - 1, zf - 1), this.grad(p[bbb], xf - 1, yf - 1, zf - 1))));
+        }
+        fade(t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+        lerp(t, a, b) { return a + t * (b - a); }
+        grad(hash, x, y, z) {
+            const h = hash & 15;
+            const u = h < 8 ? x : y;
+            const v = h < 4 ? y : h === 12 || h === 14 ? x : z;
+            return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+        }
+    }
+    
+    // Fractional Brownian Motion (fbm) creates more detailed and natural-looking noise
+    // by layering multiple "octaves" of Perlin noise at different frequencies and amplitudes.
+    function fbm(perlin, x, y, z, octaves, persistence, lacunarity) {
+        let total = 0.0, frequency = 1.0, amplitude = 1.0, maxValue = 0.0;
+        for (let i = 0; i < octaves; i++) {
+            total += perlin.noise(x * frequency, y * frequency, z * frequency) * amplitude;
+            maxValue += amplitude;
+            amplitude *= persistence;
+            frequency *= lacunarity;
+        }
+        return total / maxValue;
+    }
+
+    function smoothstep(edge0, edge1, x) {
+        const t = Math.max(0.0, Math.min(1.0, (x - edge0) / (edge1 - edge0)));
+        return t * t * (3.0 - 2.0 * t);
+    }
+
+    // =============================================================================
+    // ||        UTILITIES AND CONTROLLER FOR THE DEFORMABLE SPHERICAL MASK       ||
+    // =============================================================================
+
+    // This helper function is required for the mask controller.
+    // It creates a noise generator from a pre-calculated permutation table.
+    function createNoiseGeneratorFromPermutation(permTable) {
+        const fade = (t) => t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+        const lerp = (t, a, b) => a + t * (b - a);
+        const grad = (hash, x, y, z) => {
+            const h = hash & 15;
+            const u = h < 8 ? x : y;
+            const v = h < 4 ? y : h === 12 || h === 14 ? x : z;
+            return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+        };
+
+        return function noise(p) {
+            const P = new THREE.Vector3(Math.floor(p.x), Math.floor(p.y), Math.floor(p.z));
+            const p_fract = p.clone().sub(P);
+            const f = new THREE.Vector3(fade(p_fract.x), fade(p_fract.y), fade(p_fract.z));
+            const xi = P.x & 255, yi = P.y & 255, zi = P.z & 255;
+            const A = permTable[xi], B = permTable[(xi + 1) & 255];
+            const AA = permTable[(A + yi) & 255], BA = permTable[(B + yi) & 255];
+            const AB = permTable[(A + yi + 1) & 255], BB = permTable[(B + yi + 1) & 255];
+            const AAA = permTable[(AA + zi) & 255], BAA = permTable[(BA + zi) & 255];
+            const ABA = permTable[(AB + zi) & 255], BBA = permTable[(BB + zi) & 255];
+            const AAB = permTable[(AA + zi + 1) & 255], BAB = permTable[(BA + zi + 1) & 255];
+            const ABB = permTable[(AB + zi + 1) & 255], BBB = permTable[(BB + zi + 1) & 255];
+            const g1 = grad(AAA, p_fract.x, p_fract.y, p_fract.z), g2 = grad(BAA, p_fract.x - 1, p_fract.y, p_fract.z);
+            const g3 = grad(ABA, p_fract.x, p_fract.y - 1, p_fract.z), g4 = grad(BBA, p_fract.x - 1, p_fract.y - 1, p_fract.z);
+            const g5 = grad(AAB, p_fract.x, p_fract.y, p_fract.z - 1), g6 = grad(BAB, p_fract.x - 1, p_fract.y, p_fract.z - 1);
+            const g7 = grad(ABB, p_fract.x, p_fract.y - 1, p_fract.z - 1), g8 = grad(BBB, p_fract.x - 1, p_fract.y - 1, p_fract.z - 1);
+            return lerp(f.z, lerp(f.y, lerp(f.x, g1, g2), lerp(f.x, g3, g4)), lerp(f.y, lerp(f.x, g5, g6), lerp(f.x, g7, g8)));
+        };
+    }
+
+
+    // This class encapsulates all the logic for the deformable spherical mask.
+    // It manages parameters, noise generation, shader uniforms, and the GUI.
+    class VolumetricMaskController {
+        constructor(gui) {
+            // Default parameters to control the mask's shape
+            this.parameters = {
+                seed: 1,
+                raio: 0.52,                 // Radius
+                achatamentoCima: 0.7,       // Flatten Top
+                achatamentoBaixo: 0.3,      // Flatten Bottom
+                achatamentoXpos: 0.9,       // Flatten X positive
+                achatamentoXneg: 0.9,       // Flatten X negative
+                achatamentoZpos: 0.9,       // Flatten Z positive
+                achatamentoZneg: 0.9,       // Flatten Z negative
+                maskSoftness: 0.17,
+                forcaRuido: 0.05,           // Noise Strength
+                frequenciaRuido: 2.7,       // Noise Frequency
+
+                // Parameters for the new detail noise
+                seedDetalhe: 10,                // Detail Seed
+                forcaRuidoDetalhe: 0.036,       // Detail Noise Strength
+                frequenciaRuidoDetalhe: 10.5,   // Detail Noise Frequency
+
+                visualizeMask: false
+            };
+
+            this.noiseTexture = null;
+            this.noiseGenerator = null;
+            this.detailNoiseTexture = null;
+            this.detailNoiseGenerator = null;
+            this.uniforms = {}; // Object that will hold the uniforms for the shader.
+
+            this.regenerateNoise(); // Generate the initial noise and 3D texture for deformation.
+            this._createUniforms(); // Create the uniforms to be passed to the shader.
+            this.createGUI(gui); // Create the GUI to control the mask.
+        }
+
+        _createSeededRandom(seed) {
+            return function() {
+                let t = seed += 0x6D2B79F5;
+                t = Math.imul(t ^ t >>> 15, t | 1);
+                t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+                return ((t ^ t >>> 14) >>> 0) / 4294967296;
+            }
+        }
+
+        // Creates and populates the `uniforms` object with parameter values.
+        _createUniforms() {
+            this.uniforms = {
+                u_mask_raio:             { value: this.parameters.raio },
+                u_mask_achatamentoCima:  { value: this.parameters.achatamentoCima },
+                u_mask_achatamentoBaixo: { value: this.parameters.achatamentoBaixo },
+                u_mask_achatamentoXpos:  { value: this.parameters.achatamentoXpos },
+                u_mask_achatamentoXneg:  { value: this.parameters.achatamentoXneg },
+                u_mask_achatamentoZpos:  { value: this.parameters.achatamentoZpos },
+                u_mask_achatamentoZneg:  { value: this.parameters.achatamentoZneg },
+                u_mask_softness:         { value: this.parameters.maskSoftness },
+                u_mask_forcaRuido:       { value: this.parameters.forcaRuido },
+                u_mask_noiseMap:         { value: this.noiseTexture },
+                u_mask_forcaRuidoDetalhe: { value: this.parameters.forcaRuidoDetalhe },
+                u_mask_noiseDetailMap:    { value: this.detailNoiseTexture },
+                u_mask_visualize:        { value: this.parameters.visualizeMask }
+            };
+        }
+        
+        // Sets up the Perlin noise generator with a specific seed.
+        setupNoiseGenerator() {
+            const seededRandom = this._createSeededRandom(this.parameters.seed);
+            const p = new Uint8Array(256);
+            for (let i = 0; i < 256; i++) { p[i] = i; }
+            for (let i = 255; i > 0; i--) {
+                const j = Math.floor(seededRandom() * (i + 1));
+                [p[i], p[j]] = [p[j], p[i]];
+            }
+            const permTable = new Uint8Array(512);
+            for (let i = 0; i < 256; i++) { permTable[i] = permTable[i + 256] = p[i]; }
+            this.noiseGenerator = createNoiseGeneratorFromPermutation(permTable);
+        }
+        
+        // Generates the 3D texture used in the shader to deform the sphere.
+        updateNoiseMaskTexture() {
+            const noiseMaskSize = 128; // Resolution of the mask's noise texture.
+            const noiseMaskData = new Uint8Array(noiseMaskSize * noiseMaskSize * noiseMaskSize);
+            const directionVector = new THREE.Vector3();
+
+            for (let z = 0; z < noiseMaskSize; z++) {
+                for (let y = 0; y < noiseMaskSize; y++) {
+                    for (let x = 0; x < noiseMaskSize; x++) {
+                        directionVector.set(
+                            (x / (noiseMaskSize - 1)) * 2.0 - 1.0,
+                            (y / (noiseMaskSize - 1)) * 2.0 - 1.0,
+                            (z / (noiseMaskSize - 1)) * 2.0 - 1.0
+                        );
+
+                        if (directionVector.lengthSq() > 0) {
+                            directionVector.normalize();
+                            const noiseValue = this.noiseGenerator(directionVector.multiplyScalar(this.parameters.frequenciaRuido));
+                            noiseMaskData[(z * noiseMaskSize * noiseMaskSize) + (y * noiseMaskSize) + x] = noiseValue * 128 + 128;
+                        }
+                    }
+                }
+            }
+
+            if (!this.noiseTexture) {
+                this.noiseTexture = new THREE.Data3DTexture(noiseMaskData, noiseMaskSize, noiseMaskSize, noiseMaskSize);
+                this.noiseTexture.format = THREE.RedFormat;
+                this.noiseTexture.minFilter = THREE.LinearFilter;
+                this.noiseTexture.magFilter = THREE.LinearFilter;
+                this.noiseTexture.unpackAlignment = 1;
+            } else {
+                this.noiseTexture.image.data.set(noiseMaskData);
+            }
+            this.noiseTexture.needsUpdate = true;
+        }
+
+        // --- METHODS FOR DETAIL NOISE ---
+        // These methods are copies of the main noise methods, but adapted
+        // to use the "detail" parameters.
+
+        setupDetailNoiseGenerator() {
+            // Uses the "seedDetalhe" to create a different noise generator from the main one.
+            const seededRandom = this._createSeededRandom(this.parameters.seedDetalhe);
+            const p = new Uint8Array(256);
+            for (let i = 0; i < 256; i++) { p[i] = i; }
+            for (let i = 255; i > 0; i--) {
+                const j = Math.floor(seededRandom() * (i + 1));
+                [p[i], p[j]] = [p[j], p[i]];
+            }
+            const permTable = new Uint8Array(512);
+            for (let i = 0; i < 256; i++) { permTable[i] = permTable[i + 256] = p[i]; }
+            this.detailNoiseGenerator = createNoiseGeneratorFromPermutation(permTable);
+        }
+
+        updateDetailNoiseMaskTexture() {
+            // Generates the 3D texture for details, using "frequenciaRuidoDetalhe".
+            const noiseMaskSize = 128;
+            const noiseMaskData = new Uint8Array(noiseMaskSize * noiseMaskSize * noiseMaskSize);
+            const directionVector = new THREE.Vector3();
+
+            for (let z = 0; z < noiseMaskSize; z++) {
+                for (let y = 0; y < noiseMaskSize; y++) {
+                    for (let x = 0; x < noiseMaskSize; x++) {
+                        directionVector.set(
+                            (x / (noiseMaskSize - 1)) * 2.0 - 1.0,
+                            (y / (noiseMaskSize - 1)) * 2.0 - 1.0,
+                            (z / (noiseMaskSize - 1)) * 2.0 - 1.0
+                        );
+
+                        if (directionVector.lengthSq() > 0) {
+                            directionVector.normalize();
+                            // HERE is the main difference: uses the detail generator and frequency.
+                            const noiseValue = this.detailNoiseGenerator(directionVector.multiplyScalar(this.parameters.frequenciaRuidoDetalhe));
+                            noiseMaskData[(z * noiseMaskSize * noiseMaskSize) + (y * noiseMaskSize) + x] = noiseValue * 128 + 128;
+                        }
+                    }
+                }
+            }
+
+            // Create or update the detail texture.
+            if (!this.detailNoiseTexture) {
+                this.detailNoiseTexture = new THREE.Data3DTexture(noiseMaskData, noiseMaskSize, noiseMaskSize, noiseMaskSize);
+                this.detailNoiseTexture.format = THREE.RedFormat;
+                this.detailNoiseTexture.minFilter = THREE.LinearFilter;
+                this.detailNoiseTexture.magFilter = THREE.LinearFilter;
+                this.detailNoiseTexture.unpackAlignment = 1;
+                // Important: pass the new texture to the uniform.
+                if (this.uniforms.u_mask_noiseDetailMap) {
+                    this.uniforms.u_mask_noiseDetailMap.value = this.detailNoiseTexture;
+                }
+            } else {
+                this.detailNoiseTexture.image.data.set(noiseMaskData);
+            }
+            this.detailNoiseTexture.needsUpdate = true;
+        }
+
+        // NEW: Specific function to regenerate only the detail noise.
+        // This is more efficient as it doesn't recalculate the main noise unnecessarily.
+        regenerateDetailNoise() {
+            this.setupDetailNoiseGenerator();
+            this.updateDetailNoiseMaskTexture();
+        }
+
+        // Public function to regenerate noise when seed or frequency changes.
+        regenerateNoise() {
+            // Main Noise
+            this.setupNoiseGenerator();
+            this.updateNoiseMaskTexture();
+            
+            // Also generate the detail noise.
+            this.regenerateDetailNoise();
+        }
+
+        // Creates the folder and controls in the GUI (lil-gui).
+        createGUI(gui) {
+            const maskFolder = gui.addFolder('Cloud Shape (Mask)');
+            
+            const updateShapeUniforms = () => {
+                this.uniforms.u_mask_raio.value = this.parameters.raio;
+                this.uniforms.u_mask_achatamentoCima.value = this.parameters.achatamentoCima;
+                this.uniforms.u_mask_achatamentoBaixo.value = this.parameters.achatamentoBaixo;
+                this.uniforms.u_mask_achatamentoXpos.value = this.parameters.achatamentoXpos;
+                this.uniforms.u_mask_achatamentoXneg.value = this.parameters.achatamentoXneg;
+                this.uniforms.u_mask_achatamentoZpos.value = this.parameters.achatamentoZpos;
+                this.uniforms.u_mask_achatamentoZneg.value = this.parameters.achatamentoZneg;
+                this.uniforms.u_mask_softness.value = this.parameters.maskSoftness;
+                this.uniforms.u_mask_forcaRuido.value = this.parameters.forcaRuido;
+                this.uniforms.u_mask_forcaRuidoDetalhe.value = this.parameters.forcaRuidoDetalhe;
+            };
+
+            maskFolder.add(this.parameters, 'visualizeMask').name('Visualize Mask').onChange(v => { this.uniforms.u_mask_visualize.value = v; });
+            maskFolder.add(this.parameters, 'seed', 0, 100, 1).onChange(() => this.regenerateNoise());
+            maskFolder.add(this.parameters, 'frequenciaRuido', 0.1, 10.0, 0.1).name('Noise Frequency').onChange(() => this.updateNoiseMaskTexture());
+            maskFolder.add(this.parameters, 'raio', 0.1, 0.7, 0.01).name('Mask Radius').onChange(updateShapeUniforms);
+            maskFolder.add(this.parameters, 'maskSoftness', 0.0, 0.5, 0.005).name('Edge Softness').onChange(updateShapeUniforms);
+            maskFolder.add(this.parameters, 'forcaRuido', 0, 0.5, 0.01).name('Noise Strength (Deform.)').onChange(updateShapeUniforms);
+            
+            // NEW: Folder for flattening controls for better organization.
+            const flatteningFolder = maskFolder.addFolder('Flattening');
+            flatteningFolder.add(this.parameters, 'achatamentoCima', 0.1, 2.0, 0.05).name('Top (Y+)').onChange(updateShapeUniforms);
+            flatteningFolder.add(this.parameters, 'achatamentoBaixo', 0.1, 2.0, 0.05).name('Bottom (Y-)').onChange(updateShapeUniforms);
+            flatteningFolder.add(this.parameters, 'achatamentoXpos', 0.1, 2.0, 0.05).name('Right (X+)').onChange(updateShapeUniforms);
+            flatteningFolder.add(this.parameters, 'achatamentoXneg', 0.1, 2.0, 0.05).name('Left (X-)').onChange(updateShapeUniforms);
+            flatteningFolder.add(this.parameters, 'achatamentoZpos', 0.1, 2.0, 0.05).name('Front (Z+)').onChange(updateShapeUniforms);
+            flatteningFolder.add(this.parameters, 'achatamentoZneg', 0.1, 2.0, 0.05).name('Back (Z-)').onChange(updateShapeUniforms);
+
+            const detailFolder = maskFolder.addFolder('Detail Noise');
+            detailFolder.add(this.parameters, 'seedDetalhe', 0, 100, 1).onChange(() => this.regenerateDetailNoise());
+            detailFolder.add(this.parameters, 'frequenciaRuidoDetalhe', 0.1, 25.0, 0.1).name('Detail Frequency').onChange(() => this.updateDetailNoiseMaskTexture());
+            detailFolder.add(this.parameters, 'forcaRuidoDetalhe', 0, 0.1, 0.001).name('Detail Strength').onChange(updateShapeUniforms);
+
+            maskFolder.open();
+        }
+    }
+
+    // =============================================================================
+    // ||                          SETUP FUNCTIONS                                ||
+    // =============================================================================
+
+    /** Configures the WebGL renderer, canvas, and shadows. */
+    function setupRenderer() {
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setPixelRatio( window.devicePixelRatio );
+        renderer.setSize( window.innerWidth, window.innerHeight );
+        renderer.autoClear = false; // Required for multi-pass rendering (God Rays).
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        // Tone mapping helps to create a more realistic, cinematic look by compressing the range of colors.
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 0.8;
+        document.body.appendChild( renderer.domElement );
+    }
+
+    /** Configures and displays the statistics panel (FPS). */
+    function setupStats() {
+        stats = new Stats();
+        stats.showPanel(0); // 0: fps, 1: ms, 2: mb
+        stats.dom.style.position = 'absolute';
+        stats.dom.style.left = '10px';
+        stats.dom.style.top = '10px';
+        document.body.appendChild(stats.dom);
+    }
+
+    /** Configures the scene, camera, orbit controls, and clock. */
+    function setupSceneCameraControls() {
+        scene = new THREE.Scene();
+        scene.background = new THREE.Color('#0561a0');
+
+        camera = new THREE.PerspectiveCamera( 75, window.innerWidth / window.innerHeight, 1.0, 20000 );
+        camera.position.set( -90, -30, -30 );
+        camera.layers.enableAll(); // Ensure the camera sees all layers by default.
+
+        controls = new OrbitControls( camera, renderer.domElement );
+        clock = new THREE.Clock();
+
+        // Render Target for the depth map (used for occlusion).
+        // This captures the depth of the solid scene objects before rendering the clouds.
+        depthTarget = new THREE.WebGLRenderTarget( window.innerWidth, window.innerHeight );
+        depthTarget.depthTexture = new THREE.DepthTexture();
+        depthTarget.depthTexture.format = THREE.DepthFormat;
+        depthTarget.depthTexture.type = THREE.UnsignedShortType;
+    }
+
+    /** Configures lighting (directional, ambient) and the environment map (HDR). */
+    function setupLightingAndEnvironment() {
+        // Environment Map provides realistic ambient light and reflections.
+        new RGBELoader().load('https://dl.dropboxusercontent.com/scl/fi/c3iswf8iot8ep89jcup2t/golden_gate_hills_1k.hdr?rlkey=wlzj9qtcfxrwerezfnw038m0w', function (envMap) {
+            envMap.mapping = THREE.EquirectangularReflectionMapping;
+            scene.environment = envMap;
+        });
+
+        // Directional Light (Sun)
+        directionalLight = new THREE.DirectionalLight( 0xffffff, parameters.directionalLightIntensity );
+        directionalLight.position.set(1, 1, 1).normalize();
+        directionalLight.castShadow = true;
+        // Shadow map settings
+        directionalLight.shadow.camera.left = -50;
+        directionalLight.shadow.camera.right = 50;
+        directionalLight.shadow.camera.top = 50;
+        directionalLight.shadow.camera.bottom = -50;
+        directionalLight.shadow.camera.near = 0.5;
+        directionalLight.shadow.camera.far = 500;
+        directionalLight.shadow.mapSize.width = 2048;
+        directionalLight.shadow.mapSize.height = 2048;
+        scene.add( directionalLight );
+
+        // Ambient Light
+        ambientLight = new THREE.AmbientLight( 0xffffff, parameters.ambientLightIntensity );
+        scene.add( ambientLight );
+
+        // --- Create a fake sun object for God Rays ---
+        // This is a simple sphere that will be used to generate the light shafts.
+        sunMaterial = new THREE.MeshBasicMaterial({
+            color: 0xffddaa,
+            transparent: true,
+            fog: false
+        });
+        const sunGeometry = new THREE.SphereGeometry(200, 32, 32);
+        sun = new THREE.Mesh(sunGeometry, sunMaterial);
+        // Position the sun very far away in the same direction as the light.
+        sun.position.copy(directionalLight.position).normalize().multiplyScalar(9000);
+        sun.layers.set(VOLUME_LAYER); // Put the sun in the volume layer.
+        scene.add(sun);
+    }
+
+    /** Creates and configures the cloud volume (geometry, shader material, mesh). */
+    async function createCloudVolume(maskUniforms) { // Receives the mask uniforms as an argument.
+        const loader = new THREE.TextureLoader();
+        // Blue noise provides higher quality randomness than standard Math.random().
+        const blueNoise = await loader.loadAsync('https://dl.dropboxusercontent.com/scl/fi/c5wos6v22v1pnwy5lnext/HDR_L_0.png?rlkey=cjebnvkhcunyplntd2e223mwk');
+        blueNoise.wrapS = THREE.RepeatWrapping;
+        blueNoise.wrapT = THREE.RepeatWrapping;
+        blueNoise.minFilter = THREE.NearestFilter;
+        blueNoise.magFilter = THREE.NearestFilter;
+        
+        material = new THREE.ShaderMaterial({
+            glslVersion: THREE.GLSL3,
+            uniforms: {
+                ...maskUniforms, // Spread in the uniforms from the VolumetricMaskController.
+                uVolumeTexture: { value: null },
+                uTextureOffset: { value: new THREE.Vector3(0, 0, 0) },
+                uTextureTiling: { value: parameters.textureTiling },
+                uBlueNoise: { value: blueNoise },
+                uBlueNoiseSize: { value: new THREE.Vector2(blueNoise.image.width, blueNoise.image.height) },
+                uResolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+                cameraPos: { value: camera.position },
+                uSunColor: { value: directionalLight.color },
+                uSunIntensity: { value: directionalLight.intensity },
+                uLightDir: { value: directionalLight.position },
+                uAmbientColor: { value: ambientLight.color },
+                uAmbientIntensity: { value: ambientLight.intensity },
+                uOpacity: { value: parameters.opacity },
+                uMaxSteps: { value: parameters.raymarchSteps },
+                uLightSteps: { value: parameters.lightSteps },
+                uDensityThreshold: { value: parameters.densityThreshold },
+                uDensityMultiplier: { value: parameters.densityMultiplier },
+                uDepthTexture: { value: depthTarget.depthTexture },
+                uProjectionMatrixInverse: { value: camera.projectionMatrixInverse },
+                uViewMatrixInverse: { value: camera.matrixWorld },
+                uModelMatrix: { value: new THREE.Matrix4() },
+                uContainerScale: { value: parameters.containerScale },
+                uProjectionMatrix: { value: camera.projectionMatrix },
+                uCameraNear: { value: camera.near },
+                uCameraFar: { value: camera.far },
+                uOcclusionMode: { value: false },
+            },
+            vertexShader: VERTEX_SHADER,
+            fragmentShader: FRAGMENT_SHADER,
+            side: THREE.BackSide, // We render the inside of the box.
+            transparent: true,
+            depthWrite: false,
+            depthTest: false,
+        });
+
+        const geometry = new THREE.BoxGeometry(1, 1, 1);
+        mesh = new THREE.Mesh(geometry, material);
+        mesh.layers.set(VOLUME_LAYER);
+        mesh.scale.set(parameters.containerScale, parameters.containerScale, parameters.containerScale);
+        occluderMeshes.push(mesh); // The cloud itself can occlude God Rays.
+        scene.add(mesh);
+    }
+
+    /** Creates the solid objects in the scene (ground, spheres). */
+    function createSceneObjects() {
+        // Ground
+        const planeGeometry = new THREE.PlaneGeometry( 200, 200 );
+        const planeMaterial = new THREE.MeshStandardMaterial({ color: 0x666666, roughness: 0.8, side: THREE.DoubleSide });
+        const plane = new THREE.Mesh( planeGeometry, planeMaterial );
+        plane.rotation.x = -Math.PI / 2;
+        plane.position.y = -40;
+        plane.receiveShadow = true;
+        plane.layers.set(SOLID_LAYER); // Assign to solid layer for correct occlusion.
+        occluderMeshes.push(plane);
+        scene.add( plane );
+
+        // Green Sphere
+        const sphereGeometry = new THREE.SphereGeometry( 15.0, 32, 16 );
+        const sphereMaterial = new THREE.MeshStandardMaterial( { color: 0x00ff00, roughness: 0.3, metalness: 0.1 } );
+        const sphere = new THREE.Mesh( sphereGeometry, sphereMaterial );
+        sphere.position.set( 0, 0, 0 );
+        sphere.layers.set(SOLID_LAYER);
+        occluderMeshes.push(sphere);
+        scene.add( sphere );
+        
+        // Magenta Sphere
+        const sphereMaterialRed = new THREE.MeshStandardMaterial( { color: 0xff00ff, roughness: 0.3, metalness: 0.1 } );
+        const sphereRed = new THREE.Mesh( sphereGeometry, sphereMaterialRed );
+        sphereRed.position.set( 0, 0, -50.0 );
+        sphereRed.layers.set(SOLID_LAYER);
+        occluderMeshes.push(sphereRed);
+        scene.add( sphereRed );
+        
+        // --- Grid Helper ---
+        // Provides a visual reference for scale and position on the ground plane.
+        const gridSize = 200;
+        const gridDivisions = 50;
+        const gridHelper = new THREE.GridHelper( gridSize, gridDivisions );
+        // Position it slightly above the ground plane to avoid Z-fighting (visual flickering).
+        gridHelper.position.y = -39.9;
+        // Must be in the solid layer to be included in the depth pre-pass.
+        gridHelper.layers.set(SOLID_LAYER);
+        // Add to occluders to ensure it can block God Rays correctly.
+        occluderMeshes.push(gridHelper);
+        scene.add( gridHelper );
+    }
+
+    /** Sets up the GUI controls. */
+    function setupGUI(gui) {
+        
+        const folderGen = gui.addFolder('Texture Generation (Requires Regenerate)');
+        folderGen.add(parameters, 'textureSize', [32, 64, 96, 128, 256]).name('Texture Resolution');
+        folderGen.add( parameters, 'cloudCoverage', 0.0, 1.0, 0.01 ).name('Coverage / Threshold');
+        folderGen.add( parameters, 'cloudSoftness', 0.0, 0.5, 0.005 ).name('Edge Softness');
+        folderGen.add( parameters, 'noiseScale', 0.1, 20.0, 0.1 ).name('Scale (Zoom)');
+        folderGen.add( parameters, 'octaves', 1, 8, 1 ).name('Octaves (Detail)');
+        folderGen.add( parameters, 'persistence', 0.1, 1.0, 0.01 ).name('Persistence');
+        folderGen.add( parameters, 'lacunarity', 1.1, 4.0, 0.1 ).name('Lacunarity');
+        folderGen.add( parameters, 'noiseIntensity', 0.1, 5.0, 0.05 ).name('Noise Intensity');
+        folderGen.add( parameters, 'seed', 0, 1000, 0.01 ).name('Seed');
+        folderGen.add( parameters, 'regenerateTexture').name('▶ Generate New Texture');
+        folderGen.open();
+
+        const folderShape = gui.addFolder('Cloud Shape (Real-time)');
+        folderShape.add(parameters, 'textureTiling', 1, 10, 1).name('Tiling').onChange(v => { material.uniforms.uTextureTiling.value = v; });
+        folderShape.open();
+        
+        const folderRender = gui.addFolder('Material & Rendering (Real-time)');
+        folderRender.add(parameters, 'densityThreshold', 0.0, 1.0, 0.01).name('Density Threshold').onChange(v => { material.uniforms.uDensityThreshold.value = v; });
+        folderRender.add(parameters, 'densityMultiplier', 0.0, 100.0, 0.1).name('Density Multiplier').onChange(v => { material.uniforms.uDensityMultiplier.value = v; });
+        folderRender.add(parameters, 'opacity', 0, 20, 0.1).name('Overall Opacity').onChange(v => { material.uniforms.uOpacity.value = v; });
+        folderRender.add(parameters, 'raymarchSteps', 10, 120, 1).name('Quality (Steps)').onChange(v => { material.uniforms.uMaxSteps.value = v; });
+        folderRender.add(parameters, 'lightSteps', 0, 32, 1).name('Internal Shadow Quality').onChange(v => { material.uniforms.uLightSteps.value = v; });
+        folderRender.add(parameters, 'containerScale', 1.0, 10000.0, 1.0).name('Container Scale').onChange(v => {
+            mesh.scale.set(v, v, v);
+            material.uniforms.uContainerScale.value = v;
+        });
+        folderRender.open();
+        
+        const folderAnim = gui.addFolder('Texture Animation');
+        folderAnim.add(parameters, 'isAnimating').name('▶ Animate Cloud');
+        folderAnim.add(parameters, 'animationSpeedX', -0.2, 0.2, 0.001).name('Speed X');
+        folderAnim.add(parameters, 'animationSpeedY', -0.2, 0.2, 0.001).name('Speed Y');
+        folderAnim.add(parameters, 'animationSpeedZ', -0.2, 0.2, 0.001).name('Speed Z');
+        folderAnim.open();
+
+        const folderLighting = gui.addFolder('Lighting');
+        folderLighting.add(parameters, 'ambientLightIntensity', 0.0, 10.0, 0.05).name('Ambient Light').onChange(v => {
+            ambientLight.intensity = v;
+            material.uniforms.uAmbientIntensity.value = v;
+        });
+        folderLighting.add(parameters, 'directionalLightIntensity', 0.0, 10.0, 0.1).name('Directional Light').onChange(v => {
+            directionalLight.intensity = v;
+            material.uniforms.uSunIntensity.value = v;
+        });
+        folderLighting.open();
+
+        const folderGodRays = gui.addFolder('God Rays');
+        folderGodRays.add(godraysMaterial.uniforms.density, 'value', 0, 1, 0.01).name('Density');
+        folderGodRays.add(godraysMaterial.uniforms.decay, 'value', 0.8, 1, 0.001).name('Decay');
+        folderGodRays.add(godraysMaterial.uniforms.weight, 'value', 0, 1, 0.01).name('Weight');
+        folderGodRays.add(godraysMaterial.uniforms.exposure, 'value', 0, 1, 0.01).name('Exposure');
+        folderGodRays.add(godraysMaterial.uniforms.samples, 'value', 10, 250, 1).name('Samples');
+        folderGodRays.open();
+    }
+
+
+    /** Configures the Render Targets and materials for the God Rays effect. */
+    function setupGodRays() {
+        const renderTargetOptions = {
+            minFilter: THREE.LinearFilter,
+            magFilter: THREE.LinearFilter,
+            format: THREE.RGBAFormat,
+            type: THREE.HalfFloatType // HalfFloat for better precision, good for lighting.
+        };
+        
+        const fullResolution = new THREE.Vector2(window.innerWidth, window.innerHeight);
+        // The God Rays effect is rendered at a lower resolution for significant performance gains.
+        const effectResolution = new THREE.Vector2(window.innerWidth * 0.5, window.innerHeight * 0.5);
+
+        occlusionRenderTarget = new THREE.WebGLRenderTarget(effectResolution.x, effectResolution.y, renderTargetOptions);
+        godraysRenderTarget = new THREE.WebGLRenderTarget(effectResolution.x, effectResolution.y, renderTargetOptions);
+        
+        // The final render target remains at full resolution to maintain quality.
+        finalRenderTarget = new THREE.WebGLRenderTarget(fullResolution.x, fullResolution.y, renderTargetOptions);
+
+        occlusionMaterialBlack = new THREE.MeshBasicMaterial({ color: 0x000000 });
+        occlusionMaterialWhite = new THREE.MeshBasicMaterial({ color: 0xffffff });
+
+        godraysMaterial = new THREE.ShaderMaterial({
+            uniforms: {
+                tDiffuse: { value: occlusionRenderTarget.texture },
+                lightPosition: { value: new THREE.Vector2(0.5, 0.5) },
+                sunColor: { value: new THREE.Color(0xffddaa) },
+                density: { value: 0.98 },
+                decay: { value: 0.98 },
+                weight: { value: 0.4 },
+                exposure: { value: 0.4 },
+                samples: { value: 120 }
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }`,
+            fragmentShader: `
+                uniform sampler2D tDiffuse;
+                uniform vec2 lightPosition;
+                uniform vec3 sunColor;
+                uniform float density;
+                uniform float decay;
+                uniform float weight;
+                uniform float exposure;
+                uniform int samples;
+                varying vec2 vUv;
+
+                // This shader creates the light shafts by sampling along a line
+                // from the current pixel towards the light source in the occlusion texture.
+                void main() {
+                    vec2 lightPos = (lightPosition + 1.0) * 0.5;
+                    vec2 delta = lightPos - vUv;
+                    vec2 step = delta / float(samples);
+                    vec3 color = vec3(0.0);
+                    float illuminationDecay = 1.0;
+
+                    for(int i = 0; i < samples; i++) {
+                        vec2 sampleCoord = vUv + float(i) * step;
+                        vec4 sampleColor = texture2D(tDiffuse, sampleCoord);
+                        sampleColor *= illuminationDecay * weight;
+                        color += sampleColor.rgb;
+                        illuminationDecay *= decay;
+                    }
+                    gl_FragColor = vec4(color * sunColor * density * exposure, 1.0);
+                }`
+        });
+
+        // Setup for post-processing: a simple scene with a camera and a full-screen quad.
+        post_scene = new THREE.Scene();
+        post_camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        post_quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), godraysMaterial);
+        post_scene.add(post_quad);
+        
+        finalCompositeMaterial = new THREE.MeshBasicMaterial({
+            map: godraysRenderTarget.texture,
+            transparent: true,
+            blending: THREE.AdditiveBlending // Add the rays on top of the final scene.
+        });
+
+        finalPassMaterial = new THREE.MeshBasicMaterial({
+            map: finalRenderTarget.texture
+        });
+    }
+
+    // =============================================================================
+    // ||                          MAIN LOGIC                                   ||
+    // =============================================================================
+
+    /**
+     * Generates the 3D noise texture procedurally and applies it to the material.
+     * This is a "baking" process. It's computationally expensive but only needs to be
+     * done once (or when parameters change). This pre-calculation allows for fast,
+     * real-time sampling in the shader, which is crucial for performance.
+     */
+    function bake3DTexture() {
+        progressContainer.style.display = 'block';
+        setTimeout(() => {
+            const size = parameters.textureSize;
+            const data = new Uint8Array(size * size * size);
+            const seededRandom = createSeededRandom(parameters.seed);
+            const perlin = new ImprovedNoise(seededRandom);
+            let index = 0;
+            
+            for (let z = 0; z < size; z++) {
+                for (let y = 0; y < size; y++) {
+                    for (let x = 0; x < size; x++) {
+                        const p = parameters;
+                        const nx_norm = x / (size - 1);
+                        const ny_norm = y / (size - 1);
+                        const nz_norm = z / (size - 1);
+                        
+                        const base_x = (nx_norm) * p.noiseScale + p.seed;
+                        const base_y = (ny_norm) * p.noiseScale + p.seed;
+                        const base_z = (nz_norm) * p.noiseScale + p.seed;
+                        const scale = p.noiseScale;
+                        const fbmArgs = [p.octaves, p.persistence, p.lacunarity];
+
+                        // Sample noise at 8 corners of a cube and interpolate to avoid artifacts.
+                        const n1 = fbm(perlin, base_x, base_y, base_z, ...fbmArgs);
+                        const n2 = fbm(perlin, base_x - scale, base_y, base_z, ...fbmArgs);
+                        const n3 = fbm(perlin, base_x, base_y - scale, base_z, ...fbmArgs);
+                        const n4 = fbm(perlin, base_x, base_y, base_z - scale, ...fbmArgs);
+                        const n5 = fbm(perlin, base_x - scale, base_y - scale, base_z, ...fbmArgs);
+                        const n6 = fbm(perlin, base_x - scale, base_y, base_z - scale, ...fbmArgs);
+                        const n7 = fbm(perlin, base_x, base_y - scale, base_z - scale, ...fbmArgs);
+                        const n8 = fbm(perlin, base_x - scale, base_y - scale, base_z - scale, ...fbmArgs);
+
+                        const w_x = 1 - nx_norm;
+                        const w_y = 1 - ny_norm;
+                        const w_z = 1 - nz_norm;
+
+                        let noiseValue =
+                            n1*w_x*w_y*w_z + n2*nx_norm*w_y*w_z + n3*w_x*ny_norm*w_z + n4*w_x*w_y*nz_norm +
+                            n5*nx_norm*ny_norm*w_z + n6*nx_norm*w_y*nz_norm + n7*w_x*ny_norm*nz_norm + n8*nx_norm*ny_norm*nz_norm;
+                        
+                        noiseValue = (noiseValue + 1.0) / 2.0; // Normalize to 0-1 range.
+                        const finalValue = Math.pow(noiseValue, parameters.noiseIntensity);
+                        // Apply coverage and softness to create defined cloud shapes from the continuous noise.
+                        const density = smoothstep( p.cloudCoverage - p.cloudSoftness, p.cloudCoverage + p.cloudSoftness, finalValue );
+                        
+                        data[index++] = Math.floor(density * 255);
+                    }
+                }
+                // Update progress bar.
+                const percent = ((z + 1) / size) * 100;
+                progressFill.style.width = percent + '%';
+            }
+
+            // Dispose of the old texture to free up GPU memory.
+            if (material.uniforms.uVolumeTexture.value) {
+                material.uniforms.uVolumeTexture.value.dispose();
+            }
+            // Create the new 3D texture and assign it to the material.
+            const texture = new THREE.Data3DTexture(data, size, size, size);
+            texture.format = THREE.RedFormat; // Use RedFormat for single-channel data.
+            texture.minFilter = THREE.LinearFilter;
+            texture.magFilter = THREE.LinearFilter;
+            texture.unpackAlignment = 1;
+            texture.wrapS = THREE.RepeatWrapping;
+            texture.wrapT = THREE.RepeatWrapping;
+            texture.wrapR = THREE.RepeatWrapping;
+            texture.needsUpdate = true;
+            
+            material.uniforms.uVolumeTexture.value = texture;
+            
+            progressContainer.style.display = 'none';
+        }, 10);
+    }
+
+    // =============================================================================
+    // ||                ANIMATION LOOP & EVENTS                                ||
+    // =============================================================================
+
+    /** The main render loop, called every frame. */
+    function animate() {
+        stats.update();
+        requestAnimationFrame(animate);
+        const delta = clock.getDelta();
+        controls.update();
+
+        // --- GENERAL UPDATES ---
+        camera.updateMatrixWorld();
+        mesh.updateMatrixWorld();
+        sun.position.copy(directionalLight.position).normalize().multiplyScalar(9000);
+        
+        // Update shader uniforms that change every frame.
+        material.uniforms.uProjectionMatrixInverse.value.copy(camera.projectionMatrixInverse);
+        material.uniforms.uViewMatrixInverse.value.copy(camera.matrixWorld);
+        material.uniforms.uModelMatrix.value.copy(mesh.matrixWorld);
+        material.uniforms.uProjectionMatrix.value.copy(camera.projectionMatrix);
+        material.uniforms.cameraPos.value.copy(camera.position);
+        material.uniforms.uLightDir.value.copy(directionalLight.position);
+
+        // Animate the cloud by scrolling the 3D texture offset.
+        if (parameters.isAnimating && material.uniforms.uTextureOffset) {
+            const offset = material.uniforms.uTextureOffset.value;
+            offset.x += parameters.animationSpeedX * delta;
+            offset.y += parameters.animationSpeedY * delta;
+            offset.z += parameters.animationSpeedZ * delta;
+            // Use modulo to keep the offset within the 0-1 range for seamless tiling.
+            offset.x -= Math.floor(offset.x);
+            offset.y -= Math.floor(offset.y);
+            offset.z -= Math.floor(offset.z);
+        }
+        
+        // --- MULTI-PASS RENDERING PIPELINE ---
+        // The scene is rendered in several steps to achieve the final effect.
+
+        // STEP 1: Depth Pre-pass (for cloud occlusion).
+        // Render only the solid objects to a depth texture. The cloud shader will use this
+        // to stop ray marching when a ray hits a solid object.
+        renderer.setRenderTarget(depthTarget);
+        renderer.clear();
+        camera.layers.set(SOLID_LAYER); // Tell the camera to only see solid objects.
+        renderer.render(scene, camera);
+        
+        // STEP 2: Render the God Rays Occlusion Mask.
+        // This pass creates a black and white image where the sun is white and everything
+        // that blocks its light (solid objects, dense parts of the cloud) is black.
+        renderer.setRenderTarget(occlusionRenderTarget);
+        renderer.clear();
+        const originalSceneBackground = scene.background;
+        scene.background = new THREE.Color(0x000000); // Black background for the mask.
+
+        // 2a: Prepare all materials for the occlusion pass by temporarily overriding them.
+        sun.material = occlusionMaterialWhite; // The sun should be rendered as pure white.
+        material.uniforms.uOcclusionMode.value = true; // Switch cloud shader to occlusion mode.
+        occluderMeshes.forEach(o => {
+            if (o !== mesh) { // Don't touch the cloud material, which is already configured.
+                originalMaterials.set(o.uuid, o.material);
+                o.material = occlusionMaterialBlack; // Solid objects should be rendered as pure black.
+            }
+        });
+
+        // 2b: Render everything at once. The GPU's Z-buffer correctly handles
+        // objects in front (black spheres) being drawn over objects behind (white sun).
+        camera.layers.enable(SOLID_LAYER);
+        camera.layers.enable(VOLUME_LAYER);
+        renderer.render(scene, camera);
+
+        // 2c: Restore all original materials.
+        sun.material = sunMaterial;
+        material.uniforms.uOcclusionMode.value = false;
+        occluderMeshes.forEach(o => {
+            if (o !== mesh && originalMaterials.has(o.uuid)) {
+                o.material = originalMaterials.get(o.uuid);
+            }
+        });
+        originalMaterials.clear();
+        scene.background = originalSceneBackground;
+        camera.layers.enableAll(); // Reset camera to see everything for the next pass.
+
+        // STEP 3: Generate the God Rays texture.
+        // The post-processing shader reads the occlusion mask and creates the light shafts.
+        const sunScreenPos = new THREE.Vector3().copy(sun.position).project(camera);
+        godraysMaterial.uniforms.lightPosition.value.set(sunScreenPos.x, sunScreenPos.y);
+        post_quad.material = godraysMaterial;
+        renderer.setRenderTarget(godraysRenderTarget);
+        renderer.render(post_scene, post_camera);
+
+        // STEP 4: Render the complete main scene to a final buffer.
+        // This includes solid objects (with shadows, PBR materials) and the volumetric cloud.
+        renderer.setRenderTarget(finalRenderTarget);
+        renderer.clear();
+        renderer.render(scene, camera);
+
+        // STEP 5: Composite (add) the God Rays on top of the main scene.
+        post_quad.material = finalCompositeMaterial;
+        renderer.autoClear = false; // Important: Don't clear the main scene before adding the rays.
+        renderer.render(post_scene, post_camera);
+        renderer.autoClear = true;
+
+        // STEP 6: Render the final result to the screen.
+        renderer.setRenderTarget(null); // Render to the canvas.
+        post_quad.material = finalPassMaterial;
+        renderer.render(post_scene, post_camera);
+    }
+
+    /** Handles the window resize event. */
+    function onWindowResize() {
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+
+        camera.aspect = width / height;
+        camera.updateProjectionMatrix();
+        renderer.setSize( width, height );
+        
+        // Resize full-resolution render targets.
+        depthTarget.setSize( width, height );
+        finalRenderTarget.setSize(width, height);
+
+        // Resize effect render targets (at half resolution).
+        occlusionRenderTarget.setSize(width * 0.5, height * 0.5);
+        godraysRenderTarget.setSize(width * 0.5, height * 0.5);
+
+        if (material) {
+            material.uniforms.uResolution.value.set(width, height);
+            material.uniforms.uCameraNear.value = camera.near;
+            material.uniforms.uCameraFar.value = camera.far;
+        }
+    }
+
+    // =============================================================================
+    // ||                          INITIALIZATION                                 ||
+    // =============================================================================
+    
+    /** The main function that orchestrates the application's setup. */
+    async function init() {
+        // --- INITIAL SETUP STEPS ---
+        setupRenderer();
+        setupStats();
+        setupSceneCameraControls();
+        setupLightingAndEnvironment();
+        setupGodRays();
+        createSceneObjects();
+
+        // --- CORRECTED LOGICAL ORDER ---
+        // This initialization order is crucial for everything to link up correctly.
+
+        // 1. Create the GUI instance *first*, only once.
+        const gui = new GUI();
+
+        // 2. Create the mask controller, passing the GUI to it.
+        //    Now `maskController` exists and has its uniforms ready.
+        const maskController = new VolumetricMaskController(gui);
+
+        // 3. NOW, create the cloud volume, passing the controller's uniforms to it.
+        await createCloudVolume(maskController.uniforms);
+
+        // 4. Set up the rest of the GUI, passing the already-created GUI instance.
+        setupGUI(gui);
+
+        // --- FINAL STEPS ---
+        window.addEventListener('resize', onWindowResize);
+        bake3DTexture(); // Generate the initial 3D texture.
+        animate();       // Start the animation loop.
+    }
+
+    // --- Application Entry Point ---
+    init();
+
+</script>
+</body>
+</html>
