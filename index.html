@@ -863,7 +863,7 @@ Customizable cloud shape with PBR (Physically Based Rendering) lighting material
     /** Configures lighting (directional, ambient) and the environment map (HDR). */
     function setupLightingAndEnvironment() {
         // Environment Map provides realistic ambient light and reflections.
-        new RGBELoader().load('https://dl.dropboxusercontent.com/scl/fi/c3iswf8iot8ep89jcup2t/golden_gate_hills_1k.hdr?rlkey=wlzj9qtcfxrwerezfnw038m0w', function (envMap) {
+        new RGBELoader().load('assets/golden_gate_hills_1k.hdr', function (envMap) {
             envMap.mapping = THREE.EquirectangularReflectionMapping;
             scene.environment = envMap;
         });
@@ -906,7 +906,7 @@ Customizable cloud shape with PBR (Physically Based Rendering) lighting material
     async function createCloudVolume(maskUniforms) { // Receives the mask uniforms as an argument.
         const loader = new THREE.TextureLoader();
         // Blue noise provides higher quality randomness than standard Math.random().
-        const blueNoise = await loader.loadAsync('https://dl.dropboxusercontent.com/scl/fi/c5wos6v22v1pnwy5lnext/HDR_L_0.png?rlkey=cjebnvkhcunyplntd2e223mwk');
+        const blueNoise = await loader.loadAsync('assets/HDR_L_0.png');
         blueNoise.wrapS = THREE.RepeatWrapping;
         blueNoise.wrapT = THREE.RepeatWrapping;
         blueNoise.minFilter = THREE.NearestFilter;
