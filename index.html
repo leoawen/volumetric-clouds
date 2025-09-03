@@ -452,7 +452,7 @@ Customizable cloud shape with PBR (Physically Based Rendering) lighting material
         
         // Material & Rendering (Shader)
         densityThreshold: 0.0,
-        densityMultiplier: 80.0,
+        densityMultiplier: 50.0,
         opacity: 6.0,
         raymarchSteps: 44,
         lightSteps: 1,
@@ -465,8 +465,8 @@ Customizable cloud shape with PBR (Physically Based Rendering) lighting material
         animationSpeedZ: 0.01,
 
         // Lighting
-        ambientLightIntensity: 1.85,
-        directionalLightIntensity: 4.0,
+        ambientLightIntensity: 1.5,
+        directionalLightIntensity: 2.5,
     };
     
     // --- DOM Element References ---
@@ -825,8 +825,8 @@ Customizable cloud shape with PBR (Physically Based Rendering) lighting material
         renderer.shadowMap.enabled = true;
         renderer.shadowMap.type = THREE.PCFSoftShadowMap;
         // Tone mapping helps to create a more realistic, cinematic look by compressing the range of colors.
-        renderer.toneMapping = THREE.ACESFilmicToneMapping;
-        renderer.toneMappingExposure = 0.8;
+        // renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        // renderer.toneMappingExposure = 0.8;
         document.body.appendChild( renderer.domElement );
     }
 
